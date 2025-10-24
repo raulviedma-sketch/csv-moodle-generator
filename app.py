@@ -3,110 +3,97 @@ import streamlit as st
 import pandas as pd
 import re
 import unicodedata
+from io import StringIO
 from collections import defaultdict
-import io
 
+# Configuración de la página
 st.set_page_config(page_title="Generador CSV para Moodle", page_icon="📄", layout="centered")
 
-st.title("📄 Generador de CSV para Moodle")
-st.markdown("Sube un archivo Excel o pega texto estructurado para generar un archivo CSV compatible con Moodle.")
+st.title("📄 Generador de CSV compatible con Moodle")
+st.markdown("Convierte texto o Excel con datos de alumnos en un archivo CSV listo para importar en Moodle.")
 
-# Función para normalizar nombres y generar username
-def generar_username(nombre_completo):
-    nombre_completo = nombre_completo.lower()
-    nombre_completo = unicodedata.normalize('NFKD', nombre_completo).encode('ascii', 'ignore').decode('utf-8')
-    nombre_completo = re.sub(r"[.,'’´`]", '', nombre_completo)
-    nombre_completo = re.sub(r"\b(de|del|la|las|los|el)\b", '', nombre_completo)
-    nombre_completo = nombre_completo.replace('ñ', 'n')
-    nombre_completo = re.sub(r"\s+", ' ', nombre_completo).strip()
+# Función para normalizar texto (eliminar tildes, ñ, partículas, etc.)
+def normalizar_username(nombre, segundo_nombre, apellido):
+    def limpiar(texto):
+        texto = texto.lower()
+        texto = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('utf-8')
+        texto = re.sub(r'[^\w\s]', '', texto)
+        texto = re.sub(r'(de|del|la|las|los|el)', '', texto)
+        texto = texto.replace('ñ', 'n')
+        texto = texto.replace(' ', '')
+        return texto
 
-    partes = nombre_completo.split()
-    if len(partes) < 2:
-        return nombre_completo.replace(' ', '')
-    nombre = partes[0]
-    inicial_segundo = partes[1][0] if len(partes) > 2 else ''
-    apellido = partes[-2] if len(partes) > 2 else partes[-1]
-    return f"{nombre}{inicial_segundo}.{apellido}".replace(' ', '')
+    nombre = limpiar(nombre)
+    segundo = limpiar(segundo_nombre) if segundo_nombre else ''
+    apellido = limpiar(apellido)
+    username = f"{nombre}{segundo[:1]}.{apellido}"
+    return username
 
-# Función para extraer módulos
-def extraer_modulos(texto):
-    texto = texto.replace('.', '')
-    partes = re.split(r"con los módulos?:", texto, flags=re.IGNORECASE)
-    if len(partes) < 2:
-        return []
-    modulos = re.split(r",| y ", partes[1])
-    return [m.strip() for m in modulos if m.strip()]
-
-# Función para detectar ciclo formativo
+# Función para detectar ciclo formativo desde los módulos
 def detectar_ciclo(modulos):
     for m in modulos:
-        match = re.search(r"\[(.*?)\]", m)
-        if match:
-            return match.group(1)
+        if '_' in m:
+            ciclo = m.split('_')[0]
+            if ciclo.isalpha() and len(ciclo) >= 2:
+                return ciclo
     return "SIN_CICLO"
 
-# Procesamiento de texto estructurado
-def procesar_texto(texto):
-    alumnos = defaultdict(lambda: {"firstname": "", "lastname": "", "username": "", "email": "", "modulos": set()})
+# Función para procesar texto tabular copiado desde Excel
+def procesar_tabular(texto):
+    alumnos = defaultdict(lambda: {"firstname": "", "lastname": "", "email": "", "modulos": []})
     lineas = texto.strip().split('\n')
     for linea in lineas:
-        match = re.match(r"(.*?),\s*(.*?)\s+con correo\s+(\S+)\s+con los módulos?:\s*(.*)", linea, re.IGNORECASE)
-        if match:
-            apellidos, nombres, correo, mods = match.groups()
-            nombre_completo = f"{nombres} {apellidos}"
-            username = generar_username(nombre_completo)
-            modulos = extraer_modulos("con los módulos: " + mods)
-            ciclo = detectar_ciclo(modulos)
-            alumnos[correo]["firstname"] = f"[{ciclo}] {nombres}"
+        partes = re.split(r'\t+', linea.strip())
+        if len(partes) >= 3:
+            nombre = partes[0].strip()
+            apellidos = partes[1].strip()
+            correo = partes[2].strip().lower()
+            modulos = [m.strip() for m in partes[3:] if m.strip()]
+            alumnos[correo]["firstname"] = nombre
             alumnos[correo]["lastname"] = apellidos
-            alumnos[correo]["username"] = username
             alumnos[correo]["email"] = correo
-            alumnos[correo]["modulos"].update(modulos)
+            alumnos[correo]["modulos"].extend(modulos)
     return alumnos
 
-# Generar CSV
-def generar_csv(alumnos):
-    max_mods = max((len(data["modulos"]) for data in alumnos.values()), default=0)
-    columnas = ["username", "firstname", "lastname", "email"]
-    for i in range(1, max_mods + 1):
-        columnas += [f"course{i}", f"role{i}"]
-
+# Función para generar el DataFrame final
+def generar_dataframe(alumnos_dict):
     filas = []
-    for data in alumnos.values():
-        fila = [data["username"], data["firstname"], data["lastname"], data["email"]]
-        mods = sorted(data["modulos"])
-        for m in mods:
-            fila += [m, "student"]
-        fila += [""] * (2 * (max_mods - len(mods)))
+    max_modulos = max(len(a["modulos"]) for a in alumnos_dict.values()) if alumnos_dict else 0
+    for alumno in alumnos_dict.values():
+        nombres = alumno["firstname"].split()
+        nombre = nombres[0]
+        segundo = nombres[1] if len(nombres) > 1 else ''
+        apellido = alumno["lastname"].split()[0]
+        username = normalizar_username(nombre, segundo, apellido)
+        ciclo = detectar_ciclo(alumno["modulos"])
+        firstname = f"[{ciclo}] {alumno['firstname']}"
+        fila = {
+            "username": username,
+            "firstname": firstname,
+            "lastname": alumno["lastname"],
+            "email": alumno["email"]
+        }
+        for i, modulo in enumerate(alumno["modulos"]):
+            fila[f"course{i+1}"] = modulo
+            fila[f"role{i+1}"] = "student"
         filas.append(fila)
-
-    df = pd.DataFrame(filas, columns=columnas)
+    df = pd.DataFrame(filas)
     return df
 
 # Entrada de texto
-texto_input = st.text_area("✍️ Pega aquí el texto estructurado", height=200)
+st.subheader("✍️ Pega texto tabular copiado desde Excel")
+texto_tabular = st.text_area("Pega aquí el texto copiado desde Excel (incluye nombre, apellidos, correo y módulos)", height=200)
 
-# Entrada de archivo Excel
-archivo_excel = st.file_uploader("📄 O sube un archivo Excel (.xlsx)", type=["xlsx"])
+# Procesar texto tabular
+if texto_tabular:
+    alumnos = procesar_tabular(texto_tabular)
+    if alumnos:
+        df_final = generar_dataframe(alumnos)
+        st.success("✅ Datos procesados correctamente.")
+        st.dataframe(df_final)
 
-# Botón para procesar
-if st.button("🚀 Generar CSV"):
-    alumnos = {}
-
-    if texto_input:
-        alumnos = procesar_texto(texto_input)
-
-    if archivo_excel:
-        df_excel = pd.read_excel(archivo_excel, engine="openpyxl")
-        for _, row in df_excel.iterrows():
-            linea = f"{row[0]}, {row[1]} con correo {row[2]} con los módulos: {row[3]}"
-            alumnos.update(procesar_texto(linea))
-
-    if not alumnos:
-        st.warning("No se encontraron datos válidos.")
+        # Descargar CSV
+        csv = df_final.to_csv(index=False, sep=';', encoding='utf-8')
+        st.download_button("📥 Descargar CSV para Moodle", data=csv, file_name="moodle_alumnos.csv", mime="text/csv")
     else:
-        df_csv = generar_csv(alumnos)
-        buffer = io.StringIO()
-        df_csv.to_csv(buffer, sep=";", index=False, encoding="utf-8")
-        st.success("✅ Archivo CSV generado correctamente.")
-        st.download_button("📥 Descargar CSV", buffer.getvalue(), file_name="moodle_alumnos.csv", mime="text/csv")
+        st.error("⚠️ No se encontraron datos válidos.")
